@@ -2,7 +2,7 @@ services:
   postgres:
     image: postgres:16-alpine
     env_file:
-      - .env.local
+      - .env
     ports:
       - "5432:5432"
     volumes:
@@ -21,10 +21,18 @@ services:
     ports:
       - "1337:1337"
     env_file:
-      - .env.local
+      - .env
+    volumes:
+      - api_data:/app/apps/api/data
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "82:8025"
     restart: unless-stopped
 
 #  Optional
@@ -40,7 +48,7 @@ services:
     ports:
       - "5173:5173"
     env_file:
-      - .env.local
+      - .env
     depends_on:
       - api
     restart: unless-stopped
@@ -57,3 +65,4 @@ services:
 
 volumes:
   postgres_data:
+  api_data:

@@ -1,3 +1,7 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { mkdir, stat, unlink, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import {
   DeleteObjectCommand,
@@ -9,11 +13,24 @@ import {
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createId } from "@paralleldrive/cuid2";
 import { config } from "dotenv-mono";
+import { normalizeApiServerUrl } from "../utils/openapi-spec";
 
 config();
 
 const DEFAULT_MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024;
 const DEFAULT_PRESIGN_TTL_SECONDS = 300;
+const DEFAULT_LOCAL_UPLOAD_DIR = "data/uploads";
+const LOCAL_OBJECT_KEY_PREFIX = "local";
+const S3_CONFIG_SIGNAL_ENV_NAMES = [
+  "S3_ENDPOINT",
+  "S3_BUCKET",
+  "S3_ACCESS_KEY_ID",
+  "S3_SECRET_ACCESS_KEY",
+  "S3_REGION",
+  "S3_PUBLIC_BASE_URL",
+  "S3_KEY_PREFIX",
+  "S3_FORCE_PATH_STYLE",
+] as const;
 
 const allowedImageMimeTypes = new Set([
   "image/apng",
@@ -46,6 +63,11 @@ type StorageConfig = {
   presignTtlSeconds: number;
 };
 
+type LocalStorageConfig = {
+  rootDir: string;
+  presignTtlSeconds: number;
+};
+
 type TaskImageUploadContext = {
   workspaceId: string;
   projectId: string;
@@ -53,12 +75,30 @@ type TaskImageUploadContext = {
   surface: UploadSurface;
   filename: string;
   contentType: string;
+  size: number;
 };
 
 type TaskImageUploadUrl = {
   key: string;
   uploadUrl: string;
   headers: Record<string, string>;
+  storage: "s3" | "local";
+};
+
+type TaskImageKeyContext = Omit<
+  TaskImageUploadContext,
+  "filename" | "contentType" | "size"
+>;
+
+type LocalUploadTokenPayload = {
+  key: string;
+  expiresAt: number;
+  contentType: string;
+  size: number;
+};
+
+type LocalUploadTokenInput = LocalUploadTokenPayload & {
+  signature: string;
 };
 
 type AssetObject = {
@@ -78,6 +118,14 @@ let clientCache:
 
 function env(name: string) {
   return process.env[name]?.trim() || "";
+}
+
+function hasS3ConfigSignal() {
+  return S3_CONFIG_SIGNAL_ENV_NAMES.some((name) => Boolean(env(name)));
+}
+
+function isS3StorageConfigured() {
+  return Boolean(env("S3_ENDPOINT") && env("S3_BUCKET"));
 }
 
 export function parseBoolean(value: string | undefined, fallback: boolean) {
@@ -159,6 +207,16 @@ function getStorageConfig(): StorageConfig {
   };
 }
 
+function getLocalStorageConfig(): LocalStorageConfig {
+  return {
+    rootDir: resolve(env("LOCAL_UPLOAD_DIR") || DEFAULT_LOCAL_UPLOAD_DIR),
+    presignTtlSeconds: parsePositiveInt(
+      process.env.S3_PRESIGN_TTL_SECONDS,
+      DEFAULT_PRESIGN_TTL_SECONDS,
+    ),
+  };
+}
+
 function getMaxImageUploadBytes() {
   return parsePositiveInt(
     process.env.S3_MAX_IMAGE_UPLOAD_BYTES,
@@ -225,9 +283,7 @@ export function getFileExtension(filename: string) {
   return sanitizePathSegment(extension).slice(0, 12);
 }
 
-export function buildObjectKeyPrefix(
-  context: Omit<TaskImageUploadContext, "filename" | "contentType">,
-) {
+export function buildObjectKeyPrefix(context: TaskImageKeyContext) {
   const surfaceFolder =
     context.surface === "comment" ? "comments" : "descriptions";
 
@@ -259,6 +315,15 @@ export function buildObjectKey(context: TaskImageUploadContext) {
   return `${objectKeyPrefix}/${fileName}`;
 }
 
+function buildLocalObjectKey(rawKey: string) {
+  return `${LOCAL_OBJECT_KEY_PREFIX}/${rawKey}`;
+}
+
+function isLocalObjectKey(key: string) {
+  const normalized = key.trim().replace(/^\/+/, "");
+  return normalized.startsWith(`${LOCAL_OBJECT_KEY_PREFIX}/`);
+}
+
 export function applyKeyPrefix(prefix: string, key: string) {
   if (!prefix) return key;
   const trimmed = prefix.replace(/\/+$/, "");
@@ -286,12 +351,161 @@ export function validateTaskAssetUploadInput(
   }
 }
 
+function getLocalUploadSigningSecret() {
+  const secret = env("LOCAL_UPLOAD_SECRET") || env("AUTH_SECRET");
+
+  if (!secret) {
+    throw new Error(
+      "Local uploads require AUTH_SECRET or LOCAL_UPLOAD_SECRET to sign upload URLs.",
+    );
+  }
+
+  return secret;
+}
+
+function getLocalUploadSignaturePayload(payload: LocalUploadTokenPayload) {
+  return [
+    payload.key,
+    payload.expiresAt.toString(),
+    payload.contentType,
+    payload.size.toString(),
+  ].join("\n");
+}
+
+export function signLocalUploadToken(payload: LocalUploadTokenPayload) {
+  return createHmac("sha256", getLocalUploadSigningSecret())
+    .update(getLocalUploadSignaturePayload(payload))
+    .digest("hex");
+}
+
+function timingSafeHexEqual(left: string, right: string) {
+  try {
+    const leftBuffer = Buffer.from(left, "hex");
+    const rightBuffer = Buffer.from(right, "hex");
+
+    if (leftBuffer.length !== rightBuffer.length) {
+      return false;
+    }
+
+    return timingSafeEqual(leftBuffer, rightBuffer);
+  } catch {
+    return false;
+  }
+}
+
+function createLocalUploadUrl(payload: LocalUploadTokenPayload) {
+  const signature = signLocalUploadToken(payload);
+  const apiBaseUrl = normalizeApiServerUrl(
+    env("KANEO_API_URL") ||
+      (env("KANEO_CLIENT_URL") ? `${env("KANEO_CLIENT_URL")}/api` : ""),
+  );
+  const params = new URLSearchParams({
+    key: payload.key,
+    expires: payload.expiresAt.toString(),
+    contentType: payload.contentType,
+    size: payload.size.toString(),
+    signature,
+  });
+
+  return `${apiBaseUrl}/task/image-upload-local/object?${params.toString()}`;
+}
+
+export function assertLocalUploadToken(input: LocalUploadTokenInput) {
+  if (!Number.isFinite(input.expiresAt) || input.expiresAt <= 0) {
+    throw new Error("Invalid local upload expiration.");
+  }
+
+  if (input.expiresAt < Math.floor(Date.now() / 1000)) {
+    throw new Error("Local upload URL has expired.");
+  }
+
+  const expectedSignature = signLocalUploadToken({
+    key: input.key,
+    expiresAt: input.expiresAt,
+    contentType: input.contentType,
+    size: input.size,
+  });
+
+  if (!timingSafeHexEqual(expectedSignature, input.signature)) {
+    throw new Error("Invalid local upload signature.");
+  }
+}
+
+function resolveLocalObjectPath(key: string) {
+  const normalizedKey = key.trim().replace(/^\/+/, "");
+
+  if (
+    !isLocalObjectKey(normalizedKey) ||
+    normalizedKey.includes("\\") ||
+    normalizedKey.split("/").some((segment) => segment === "..")
+  ) {
+    throw new Error("Invalid local storage key.");
+  }
+
+  const { rootDir } = getLocalStorageConfig();
+  const filePath = resolve(rootDir, normalizedKey);
+  const relativePath = relative(rootDir, filePath);
+
+  if (
+    !relativePath ||
+    relativePath.startsWith("..") ||
+    isAbsolute(relativePath)
+  ) {
+    throw new Error("Invalid local storage key.");
+  }
+
+  return filePath;
+}
+
+export async function writeLocalObject({
+  key,
+  body,
+  contentType,
+  size,
+}: {
+  key: string;
+  body: Buffer;
+  contentType: string;
+  size: number;
+}) {
+  validateTaskAssetUploadInput(contentType, size);
+
+  if (body.byteLength !== size) {
+    throw new Error("Upload size does not match the signed upload request.");
+  }
+
+  const filePath = resolveLocalObjectPath(key);
+  await mkdir(dirname(filePath), { recursive: true });
+  await writeFile(filePath, body);
+}
+
 export async function createTaskImageUploadUrl(
   context: TaskImageUploadContext,
 ): Promise<TaskImageUploadUrl> {
+  const rawKey = buildObjectKey(context);
+
+  if (!hasS3ConfigSignal()) {
+    const config = getLocalStorageConfig();
+    const key = buildLocalObjectKey(rawKey);
+    const expiresAt = Math.floor(Date.now() / 1000) + config.presignTtlSeconds;
+
+    return {
+      key,
+      uploadUrl: createLocalUploadUrl({
+        key,
+        expiresAt,
+        contentType: context.contentType,
+        size: context.size,
+      }),
+      headers: {
+        "Content-Type": context.contentType,
+      },
+      storage: "local",
+    };
+  }
+
   const config = getStorageConfig();
   const client = getClient(config);
-  const rawKey = buildObjectKey(context);
   const key = applyKeyPrefix(config.keyPrefix, rawKey);
 
   const command = new PutObjectCommand({
@@ -310,6 +524,7 @@ export async function createTaskImageUploadUrl(
     headers: {
       "Content-Type": context.contentType,
     },
+    storage: "s3",
   };
 }
 
@@ -319,15 +534,41 @@ export function assertStorageConfigured() {
 
 export function assertTaskImageKeyMatchesContext(
   key: string,
-  context: Omit<TaskImageUploadContext, "filename" | "contentType">,
+  context: TaskImageKeyContext,
 ) {
+  if (isLocalObjectKey(key)) {
+    const objectPrefix = buildObjectKeyPrefix(context);
+    return key.startsWith(`${buildLocalObjectKey(objectPrefix)}/`);
+  }
+
+  if (!isS3StorageConfigured()) {
+    return false;
+  }
+
   const config = getStorageConfig();
   const objectPrefix = buildObjectKeyPrefix(context);
   const fullPrefix = `${applyKeyPrefix(config.keyPrefix, objectPrefix)}/`;
   return key.startsWith(fullPrefix);
 }
 
+async function getLocalObject(key: string): Promise<AssetObject> {
+  const filePath = resolveLocalObjectPath(key);
+  const fileStat = await stat(filePath);
+
+  return {
+    body: Readable.toWeb(createReadStream(filePath)),
+    contentType: undefined,
+    contentLength: fileStat.size,
+    etag: `W/"${fileStat.size}-${Math.floor(fileStat.mtimeMs)}"`,
+    lastModified: fileStat.mtime,
+  };
+}
+
 export async function getPrivateObject(key: string): Promise<AssetObject> {
+  if (isLocalObjectKey(key)) {
+    return getLocalObject(key);
+  }
+
   const config = getStorageConfig();
   const client = getClient(config);
   const response = await client.send(
@@ -356,6 +597,17 @@ export async function getPrivateObject(key: string): Promise<AssetObject> {
 }
 
 export async function deleteS3Object(key: string): Promise<void> {
+  if (isLocalObjectKey(key)) {
+    try {
+      await unlink(resolveLocalObjectPath(key));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+    return;
+  }
+
   const config = getStorageConfig();
   const client = getClient(config);
   await client.send(

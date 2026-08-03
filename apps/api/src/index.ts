@@ -527,7 +527,8 @@ export function createApp() {
     if (
       path.startsWith("/api/mcp") ||
       path.startsWith("/api/.well-known/") ||
-      path === "/api/billing/webhook"
+      path === "/api/billing/webhook" ||
+      path === "/api/task/image-upload-local/object"
     ) {
       return next();
     }

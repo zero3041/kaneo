@@ -1,13 +1,61 @@
 import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import db, { schema } from "../../apps/api/src/database";
 import { createApp } from "../../apps/api/src/index";
+import { signLocalUploadToken } from "../../apps/api/src/storage/s3";
 import { mockAnonymousSession, mockAuthenticatedSession } from "./helpers/auth";
 import { resetTestDatabase } from "./helpers/database";
 import {
   createProjectFixture,
   createWorkspaceMember,
 } from "./helpers/fixtures";
+
+const s3ConfigKeys = [
+  "S3_ENDPOINT",
+  "S3_BUCKET",
+  "S3_ACCESS_KEY_ID",
+  "S3_SECRET_ACCESS_KEY",
+  "S3_REGION",
+  "S3_PUBLIC_BASE_URL",
+  "S3_KEY_PREFIX",
+  "S3_FORCE_PATH_STYLE",
+] as const;
+
+function clearS3Config() {
+  for (const key of s3ConfigKeys) {
+    delete process.env[key];
+  }
+}
+
+function createSignedLocalUploadUrl({
+  key,
+  contentType = "image/png",
+  size = 5,
+  expiresAt = Math.floor(Date.now() / 1000) + 300,
+}: {
+  key: string;
+  contentType?: string;
+  size?: number;
+  expiresAt?: number;
+}) {
+  const params = new URLSearchParams({
+    key,
+    expires: expiresAt.toString(),
+    contentType,
+    size: size.toString(),
+    signature: signLocalUploadToken({
+      key,
+      expiresAt,
+      contentType,
+      size,
+    }),
+  });
+
+  return `/api/task/image-upload-local/object?${params.toString()}`;
+}
 
 describe("API integration: task image upload finalize", () => {
   beforeEach(async () => {
@@ -430,5 +478,86 @@ describe("API integration: task image upload finalize", () => {
     await expect(response.text()).resolves.toBe(
       "You don't have access to this workspace",
     );
+  });
+});
+
+describe("API integration: local task image upload endpoint", () => {
+  let uploadDir: string;
+
+  beforeEach(async () => {
+    clearS3Config();
+    uploadDir = await mkdtemp(join(tmpdir(), "kaneo-local-upload-"));
+    process.env.AUTH_SECRET = "test-secret-with-at-least-32-chars";
+    process.env.LOCAL_UPLOAD_DIR = uploadDir;
+  });
+
+  afterEach(async () => {
+    await rm(uploadDir, { recursive: true, force: true });
+    delete process.env.LOCAL_UPLOAD_DIR;
+  });
+
+  it("stores a signed local upload without an authenticated session", async () => {
+    mockAnonymousSession();
+    const { app } = createApp();
+    const key =
+      "local/workspace/workspace-1/project/project-1/task/task-1/descriptions/image.png";
+    const response = await app.request(createSignedLocalUploadUrl({ key }), {
+      method: "PUT",
+      headers: { "content-type": "image/png" },
+      body: "hello",
+    });
+
+    expect(response.status).toBe(204);
+    await expect(readFile(join(uploadDir, key), "utf8")).resolves.toBe("hello");
+  });
+
+  it("rejects local uploads with a content type header mismatch", async () => {
+    const { app } = createApp();
+    const key =
+      "local/workspace/workspace-1/project/project-1/task/task-1/descriptions/image.png";
+    const response = await app.request(createSignedLocalUploadUrl({ key }), {
+      method: "PUT",
+      headers: { "content-type": "image/jpeg" },
+      body: "hello",
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toContain(
+      "Upload content type does not match",
+    );
+  });
+
+  it("rejects local uploads larger than the signed size", async () => {
+    const { app } = createApp();
+    const key =
+      "local/workspace/workspace-1/project/project-1/task/task-1/descriptions/image.png";
+    const response = await app.request(createSignedLocalUploadUrl({ key }), {
+      method: "PUT",
+      headers: { "content-type": "image/png" },
+      body: "hello!",
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toContain("Upload size exceeds");
+  });
+
+  it("rejects expired local upload URLs", async () => {
+    const { app } = createApp();
+    const key =
+      "local/workspace/workspace-1/project/project-1/task/task-1/descriptions/image.png";
+    const response = await app.request(
+      createSignedLocalUploadUrl({
+        key,
+        expiresAt: Math.floor(Date.now() / 1000) - 1,
+      }),
+      {
+        method: "PUT",
+        headers: { "content-type": "image/png" },
+        body: "hello",
+      },
+    );
+
+    expect(response.status).toBe(403);
+    await expect(response.text()).resolves.toContain("expired");
   });
 });

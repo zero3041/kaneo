@@ -210,6 +210,7 @@ describe("S3 helpers", () => {
       surface: "description",
       filename: "report.png",
       contentType: "image/png",
+      size: 1024,
     });
 
     const searchParams = new URL(upload.uploadUrl).searchParams;
@@ -327,6 +328,7 @@ describe("S3 credential provider chain (IAM role)", () => {
       surface: "description",
       filename: "report.png",
       contentType: "image/png",
+      size: 1024,
     });
 
     const searchParams = new URL(upload.uploadUrl).searchParams;

@@ -34,6 +34,20 @@ describe("getInvitationEmailSubject", () => {
     );
   });
 
+  it("uses Vietnamese copy for regional Vietnamese locales", () => {
+    const locale = "vi-VN";
+    const inviterName = "An";
+    const workspaceName = "Nhóm sản phẩm";
+
+    const subject = getInvitationEmailSubject(
+      locale,
+      inviterName,
+      workspaceName,
+    );
+
+    expect(subject).toBe("An đã mời bạn tham gia Nhóm sản phẩm trên Kaneo");
+  });
+
   it("uses the English fallback for unsupported locales", () => {
     const locale = "es-ES";
     const inviterName = "Alice";

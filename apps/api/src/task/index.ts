@@ -13,10 +13,12 @@ import {
 } from "../database/schema";
 import { taskSchema } from "../schemas";
 import {
+  assertLocalUploadToken,
   assertTaskImageKeyMatchesContext,
   createTaskImageUploadUrl,
   isImageContentType,
   validateTaskAssetUploadInput,
+  writeLocalObject,
 } from "../storage/s3";
 import { normalizeApiServerUrl } from "../utils/openapi-spec";
 import { requireWorkspacePermission } from "../utils/require-workspace-permission";
@@ -37,6 +39,48 @@ import updateTaskPriority from "./controllers/update-task-priority";
 import updateTaskStatus from "./controllers/update-task-status";
 import updateTaskTitle from "./controllers/update-task-title";
 import { VALID_PRIORITIES } from "./validate-task-fields";
+
+function normalizeContentType(value: string | undefined) {
+  const [mimeType = ""] = (value || "").split(";");
+  return mimeType.trim().toLowerCase();
+}
+
+async function readUploadBodyWithinSignedSize(request: Request, size: number) {
+  if (!request.body) {
+    return Buffer.alloc(0);
+  }
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let receivedBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      if (!value) {
+        continue;
+      }
+
+      receivedBytes += value.byteLength;
+      if (receivedBytes > size) {
+        throw new HTTPException(400, {
+          message: "Upload size exceeds the signed upload request.",
+        });
+      }
+
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks, receivedBytes);
+}
 
 const task = new Hono<{
   Variables: {
@@ -611,6 +655,95 @@ const task = new Hono<{
   )
 
   .put(
+    "/image-upload-local/object",
+    describeRoute({
+      operationId: "putLocalTaskImageUpload",
+      tags: ["Tasks"],
+      description:
+        "Upload a task image or attachment to local API storage using a signed local upload URL",
+      responses: {
+        204: {
+          description: "Local upload stored successfully",
+        },
+      },
+    }),
+    validator(
+      "query",
+      v.object({
+        key: v.string(),
+        expires: v.string(),
+        signature: v.string(),
+        contentType: v.string(),
+        size: v.string(),
+      }),
+    ),
+    async (c) => {
+      const { key, expires, signature, contentType, size } =
+        c.req.valid("query");
+      const expiresAt = Number.parseInt(expires, 10);
+      const uploadSize = Number.parseInt(size, 10);
+
+      try {
+        assertLocalUploadToken({
+          key,
+          expiresAt,
+          contentType,
+          size: uploadSize,
+          signature,
+        });
+        validateTaskAssetUploadInput(contentType, uploadSize);
+      } catch (error) {
+        throw new HTTPException(403, {
+          message:
+            error instanceof Error
+              ? error.message
+              : "Invalid local upload URL.",
+        });
+      }
+
+      const contentLength = Number.parseInt(
+        c.req.header("content-length") || "",
+        10,
+      );
+      if (Number.isFinite(contentLength) && contentLength > uploadSize) {
+        throw new HTTPException(400, {
+          message: "Upload size exceeds the signed upload request.",
+        });
+      }
+
+      if (
+        normalizeContentType(c.req.header("content-type")) !==
+        normalizeContentType(contentType)
+      ) {
+        throw new HTTPException(400, {
+          message:
+            "Upload content type does not match the signed upload request.",
+        });
+      }
+
+      try {
+        const body = await readUploadBodyWithinSignedSize(
+          c.req.raw,
+          uploadSize,
+        );
+        await writeLocalObject({
+          key,
+          body,
+          contentType,
+          size: uploadSize,
+        });
+      } catch (error) {
+        throw new HTTPException(400, {
+          message:
+            error instanceof Error ? error.message : "Failed to store upload.",
+        });
+      }
+
+      return c.body(null, 204);
+    },
+  )
+
+  .put(
     "/image-upload/:id",
     describeRoute({
       operationId: "createTaskImageUpload",
@@ -681,6 +814,7 @@ const task = new Hono<{
           surface,
           filename,
           contentType,
+          size,
         });
 
         return c.json(upload);
